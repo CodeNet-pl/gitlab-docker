@@ -1,0 +1,380 @@
+#!/bin/bash
+
+ROOT_DIR=$(git rev-parse --show-toplevel)
+
+if [ -z "$ROOT_DIR" ]; then
+    exit 1
+fi
+
+BRANCH=$(cd $ROOT_DIR; git branch | grep \* | cut -d ' ' -f2  | tr '[:upper:]' '[:lower:]')
+REMOTE=$(cd $ROOT_DIR; git config --get remote.origin.url  | tr '[:upper:]' '[:lower:]')
+IMAGES_DIR=docker/images
+RANCHER_DIR=docker/rancher
+RANCHER_LB_STACK=load-balancer
+CONFIG_FILE=$ROOT_DIR/.gitlab-docker
+TMP_DIR=/tmp/.gitlab-docker
+mkdir -p $TMP_DIR
+
+declare -A BRANCH_TAG_MAP=( ["master"]="stable" ["develop"]="latest")
+declare -A BRANCH_TAG_MAP_DEBUG=( ["master"]="stable-debug" ["develop"]="debug")
+
+TAG=${BRANCH_TAG_MAP[$BRANCH]:-$BRANCH}
+TAG=${TAG/\//-}
+TAG_DEBUG=${BRANCH_TAG_MAP_DEBUG[$BRANCH]:-${BRANCH}-debug}
+TAG_DEBUG=${TAG_DEBUG/\//-}
+
+re="\.[a-z]+[:/]([^./]*)/([^./]*)"
+if [[ $REMOTE =~ $re ]]; then
+    GIT_GROUP=`echo ${BASH_REMATCH[1]} | tr '[:upper:]' '[:lower:]'`
+    GIT_PROJECT=`echo ${BASH_REMATCH[2]} | tr '[:upper:]' '[:lower:]'`
+else
+    echo 'Unable to extract project name from GIT remote'
+    exit 1
+fi
+
+RANCHER_STACK=${GIT_GROUP}-${GIT_PROJECT}
+
+DOCKER_IMAGES=.
+for dir in $ROOT_DIR/$IMAGES_DIR/*; do
+    if [ -d $dir ] && [ -f $dir/Dockerfile ]; then
+    DOCKER_IMAGES="$DOCKER_IMAGES ${dir/$ROOT_DIR\/$IMAGES_DIR\//}"
+    fi
+done
+
+
+if [ -f $CONFIG_FILE ]; then
+    . $CONFIG_FILE
+fi
+
+# Runtime options
+VERBOSITY=normal
+COMMAND=$1
+shift
+
+init_config () {
+    echo -n "Please enter docker registry domain name [$DOCKER_REGISTRY]: "
+    read registry
+
+    if [ ! -z $registry ]; then
+        DOCKER_REGISTRY=$registry
+    fi
+
+    printf "DOCKER_REGISTRY=$DOCKER_REGISTRY\n" > $CONFIG_FILE
+}
+
+image_name () {
+    path=$1
+    shift
+    tag=$1
+    shift
+    image=$IMAGE_NAME
+
+    if [ "$path" != "." ]; then
+        tag=${path}-${tag}
+    fi
+
+    echo "${image}:${tag}"
+}
+
+image_path () {
+    path=$1
+    shift
+
+    if [ "$path" != "." ]; then
+        path=$IMAGES_DIR/$path
+    else
+        path=.
+    fi
+
+    echo "$path"
+}
+
+build () {
+    image_tag=$(image_name $1 $2)
+    path=$(image_path $1)
+    shift
+    shift
+    echo "Building image $image_tag in $path ..."
+    (cd $ROOT_DIR; exec_quietly docker build --pull $@ -t $image_tag $path)
+}
+
+push () {
+    image_tag=$(image_name $1 $2)
+    echo "Pushing image $image_tag ..."
+    exec_quietly docker push $image_tag > /dev/null
+}
+
+exec_quietly () {
+    if [ "$VERBOSITY" == "verbose" ]; then
+        $@
+
+        if [ $? -ne 0 ]; then
+            echo "Error running: $@"
+            exit 1
+        fi
+    else
+        $@ > /tmp/$RANCHER_STACK.log
+        if [ $? -ne 0 ]; then
+            tail /tmp/$RANCHER_STACK.log
+            echo "Error running: $@"
+            exit 1
+        fi
+    fi
+}
+
+init_structure () {
+    if [ ! -d "$ROOT_DIR/$IMAGES_DIR/fpm" ]; then
+        mkdir -p "$ROOT_DIR/$IMAGES_DIR/fpm"
+    fi
+    if [ ! -f "$ROOT_DIR/$IMAGES_DIR/fpm/Dockerfile" ]; then
+        cat > $ROOT_DIR/$IMAGES_DIR/fpm/Dockerfile << EOL
+FROM php:7.1-fpm-alpine
+ARG APP_ENV
+WORKDIR /app
+EOL
+    fi
+    if [ ! -d "$ROOT_DIR/$IMAGES_DIR/cli" ]; then
+        mkdir -p "$ROOT_DIR/$IMAGES_DIR/cli"
+    fi
+    if [ ! -f "$ROOT_DIR/$IMAGES_DIR/cli/Dockerfile" ]; then
+        cat > $ROOT_DIR/$IMAGES_DIR/cli/Dockerfile << EOL
+FROM php:7.1-alpine
+ARG APP_ENV
+WORKDIR /app
+EOL
+    fi
+    if [ ! -d "$ROOT_DIR/$RANCHER_DIR" ]; then
+        mkdir -p "$ROOT_DIR/$RANCHER_DIR"
+    fi
+    if [ ! -f $ROOT_DIR/Dockerfile ]; then
+        cat > $ROOT_DIR/Dockerfile << EOL
+FROM php:7.1-alpine
+ADD . /app
+WORKDIR /app
+RUN rm -rf docker
+
+EOL
+    fi
+
+    if [ ! -f "$ROOT_DIR/.dockerignore" ]; then
+        cat > $ROOT_DIR/.dockerignore << EOL
+vendor
+EOL
+    fi
+}
+
+EXECUTABLE=$(basename $0)
+
+cmd_help () {
+    echo $1
+    echo
+    echo "Usage:"
+    echo "   $EXECUTABLE $2"
+    echo
+
+    exit 0
+}
+
+run_application () {
+    COMMAND=$1
+    shift
+
+    if [ -z "$DOCKER_REGISTRY" ] && [ "$1" != "init" ]; then
+        echo "Unknown docker registry, please setup DOCKER_REGISTRY variable in configuration file at $CONFIG_FILE"
+        exit 1
+    fi
+
+    if [ -z "$IMAGE_NAME" ]; then
+        IMAGE_NAME=$DOCKER_REGISTRY/$GIT_GROUP/$GIT_PROJECT
+    fi
+
+    case "$COMMAND" in
+        config )
+            echo "Docker registry [DOCKER_REGISTRY]: $DOCKER_REGISTRY"
+            echo "GIT Group [GIT_GROUP]: $GIT_GROUP"
+            echo "GIT Project [GIT_PROJECT]: $GIT_PROJECT"
+            echo "Deploy stack [RANCHER_STACK]: $RANCHER_STACK"
+            echo "Branch [BRANCH]: $BRANCH"
+            echo "Docker image name [IMAGE_NAME]: $IMAGE_NAME"
+            echo "Docker images: $DOCKER_IMAGES"
+            echo "Image tag: $TAG"
+            echo "Image Debug Tag: $TAG_DEBUG"
+            echo "Temporary directory: $TMP_DIR"
+            echo
+            echo "You can override any of those variables in configuration file $CONFIG_FILE"
+
+            ;;
+
+        init )
+            init_config
+            init_structure
+            ;;
+        build )
+            
+            while [[ $# -gt 0 ]]
+            do
+                case "$1" in
+                    -v|--verbose)
+                        VERBOSITY=verbose
+                    ;;
+                    -h|--help)
+                        cmd_help "Build images given as argument" "build [image1 image2 ...] [-v|--verbose]"
+                        ;;
+                    *)
+                        IMAGES="$IMAGES $1"
+                    ;;
+                esac
+                shift # past argument or value
+            done
+
+            if [ -z "$IMAGES" ]; then
+                IMAGES=$DOCKER_IMAGES
+            fi
+
+            for image in $IMAGES; do
+                build $image $TAG --build-arg APP_ENV=prod || exit 1
+                build $image $TAG_DEBUG --build-arg APP_ENV=dev || exit 1
+            done
+
+            ;;
+
+        push )
+            
+            while [[ $# -gt 0 ]]
+            do
+                case "$1" in
+                    -v)
+                        VERBOSITY=verbose
+                    ;;
+                    -h|--help)
+                        cmd_help "Push images given as argument" "push [image1 image2 ...] [-v|--verbose]"
+                    ;;
+                    *)
+                        IMAGES="$IMAGES $1"
+                    ;;
+                esac
+                shift # past argument or value
+            done
+            
+            if [ -z "$IMAGES" ]; then
+                IMAGES=$DOCKER_IMAGES
+            fi
+
+            for image in $IMAGES; do
+                push $image $TAG || exit 1
+                push $image $TAG_DEBUG || exit 1
+            done
+        ;;
+
+        rancher )
+            
+            RANCHER_COMMAND=$1
+            shift
+            ARGS=
+
+            while [[ $# -gt 0 ]]
+            do
+                case "$1" in
+                    -v)
+                        VERBOSITY=verbose
+                    ;;
+                    -h|--help)
+                        cmd_help "Execute rancher command" "rancher [up|down|exec|export] [-v|--verbose]"
+                    ;;
+                    *)
+                        if [ -z $ARGS ]; then
+                            ARGS=$1
+                        else
+                            ARGS="$ARGS $1"
+                        fi
+                    ;;
+                esac
+                shift # past argument or value
+            done
+
+
+            cd $ROOT_DIR/docker/rancher;
+
+            case "$RANCHER_COMMAND" in
+                up )
+                    (
+                    export ROOT_DIR
+                    export TAG
+                    export TAG_DEBUG
+                    export UID
+                    exec_quietly rancher up -d -s $RANCHER_STACK --confirm-upgrade --force-upgrade $ARGS
+                    )
+                    ;;
+                down )
+                    rancher rm $RANCHER_STACK
+                    ;;
+                exec )
+                    echo "rancher exec $RANCHER_STACK/$ARGS"
+                    rancher exec $RANCHER_STACK/$ARGS
+                ;;
+                export )
+                    exec_quietly rancher export $RANCHER_STACK
+                    mv $RANCHER_STACK export
+                    ;;
+                * )
+                    echo "Available actions: up, down"
+                    ;;
+            esac
+        ;;
+
+        compose )
+            export ROOT_DIR;
+            export TAG
+            export TAG_DEBUG
+
+            cd $ROOT_DIR/docker/compose
+            case $2 in
+                up )
+                    docker-compose -p $RANCHER_STACK up -d
+                    ;;
+                down )
+                    docker-compose -p $RANCHER_STACK down
+                    ;;
+                * )
+                    echo "Available actions: up, down"
+                    ;;
+            esac
+        ;;
+
+        cleanup )
+            # WIP
+            echo "Removing build images..."
+            docker images | grep $IMAGE_NAME | awk '{ print $3 }' | xargs docker rmi
+        ;;
+
+        mongodump )
+            # WIP
+            rancher exec -i $RANCHER_STACK/mongo mongodump --gzip --archive > $ROOT_DIR/$IMAGES_DIR/mongo/backup.bz2
+        ;;
+
+        mongorestore )
+            # WIP
+            echo 'foo' | rancher exec -i $RANCHER_STACK/mongo xargs echo #$ROOT_DIR/$IMAGES_DIR/mongo/backup.bz2  #mongorestore --gzip --archive
+        ;;
+
+        * )
+            echo "GitLab Docker v0.2.0-dev"
+            echo "Usage:"
+            echo "   "`basename $0`" [config|build|push|deploy|cleanup]"
+            echo
+            echo "Examples:"
+            echo "   "`basename $0`" config - show configuration"
+            echo "   "`basename $0`" build <image> - build all images or image given as argument"
+            echo "   "`basename $0`" push <image> - push all images or image given as argument"
+            echo "   "`basename $0`" deploy - deploy project using rancher"
+        ;;
+    esac
+
+    if [ ! -z $TMP_DIR ] && [ -d $TMP_DIR ]; then
+        rm -rf $TMP_DIR
+    fi
+
+}
+
+run_application $COMMAND $@
+
