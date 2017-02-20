@@ -6,8 +6,13 @@ if [ -z "$ROOT_DIR" ]; then
     exit 1
 fi
 
-BRANCH=$(cd $ROOT_DIR; git branch | grep \* | cut -d ' ' -f2  | tr '[:upper:]' '[:lower:]')
-REMOTE=$(cd $ROOT_DIR; git config --get remote.origin.url  | tr '[:upper:]' '[:lower:]')
+if [ -z "$CI_BUILD_REF_NAME" ]; then
+    BRANCH=$(git branch | grep \* | cut -d ' ' -f2  | tr '[:upper:]' '[:lower:]')
+else
+    BRANCH=$CI_BUILD_REF_NAME
+fi
+
+REMOTE=$(git config --get remote.origin.url  | tr '[:upper:]' '[:lower:]')
 IMAGES_DIR=docker/images
 RANCHER_DIR=docker/rancher
 RANCHER_LB_STACK=load-balancer
@@ -23,13 +28,19 @@ TAG=${TAG/\//-}
 TAG_DEBUG=${BRANCH_TAG_MAP_DEBUG[$BRANCH]:-${BRANCH}-debug}
 TAG_DEBUG=${TAG_DEBUG/\//-}
 
+fail () {
+    if [ ! -z "$@" ]; then
+        echo $@
+    fi
+    on_exit 1
+}
+
 re="\.[a-z]+[:/]([^./]*)/([^./]*)"
 if [[ $REMOTE =~ $re ]]; then
     GIT_GROUP=`echo ${BASH_REMATCH[1]} | tr '[:upper:]' '[:lower:]'`
     GIT_PROJECT=`echo ${BASH_REMATCH[2]} | tr '[:upper:]' '[:lower:]'`
 else
-    echo 'Unable to extract project name from GIT remote'
-    exit 1
+    fail 'Unable to extract project name from GIT remote'
 fi
 
 RANCHER_STACK=${GIT_GROUP}-${GIT_PROJECT}
@@ -50,6 +61,28 @@ fi
 VERBOSITY=normal
 COMMAND=$1
 shift
+export ON_EXIT_COMMAND="remove_temp_dir"
+
+on_exit() {
+    cleanup_compiled_dockerfiles
+
+    exit $1
+}
+
+cleanup_compiled_dockerfiles () {
+    for img in $DOCKER_IMAGES; do
+        img_path=$(image_path $img)
+        if [ -f $img_path/.Dockerfile ]; then
+            rm $img_path/.Dockerfile # remove temporary build file
+        fi
+    done
+}
+
+remove_temp_dir() {
+    if [ ! -z $TMP_DIR ] && [ -d $TMP_DIR ]; then
+        rm -rf $TMP_DIR
+    fi
+}
 
 init_config () {
     echo -n "Please enter docker registry domain name [$DOCKER_REGISTRY]: "
@@ -85,17 +118,24 @@ image_path () {
     else
         path=.
     fi
-
     echo "$path"
 }
 
 build () {
-    image_tag=$(image_name $1 $2)
-    path=$(image_path $1)
+    BUILD_IMAGE_DIR=$(image_path $1)
+    BUILD_IMAGE_NAME=$(image_name $1 $2)
+    BUILD_CONTEXT=$BUILD_IMAGE_DIR
+    BUILD_DOCKERFILE=$BUILD_IMAGE_DIR/Dockerfile
+    BUILD_TAG=$2
     shift
     shift
-    echo "Building image $image_tag in $path ..."
-    (cd $ROOT_DIR; exec_quietly docker build --pull $@ -t $image_tag $path)
+
+    echo "Building image $BUILD_IMAGE_NAME in $BUILD_CONTEXT with $BUILD_DOCKERFILE ..."
+    (
+        cat $BUILD_DOCKERFILE | awk "{ if (\$1 == \"INCLUDE\") system(\"cat \"\$2); else print \$0 }" | envsubst '$BUILD_TAG' > $BUILD_CONTEXT/.Dockerfile
+        exec_quietly docker build --pull $@ -t $BUILD_IMAGE_NAME -f $BUILD_CONTEXT/.Dockerfile $BUILD_CONTEXT
+        rm $BUILD_CONTEXT/.Dockerfile
+    )
 }
 
 push () {
@@ -109,15 +149,13 @@ exec_quietly () {
         $@
 
         if [ $? -ne 0 ]; then
-            echo "Error running: $@"
-            exit 1
+            fail "Error running: $@"
         fi
     else
         $@ > /tmp/$RANCHER_STACK.log
         if [ $? -ne 0 ]; then
             tail /tmp/$RANCHER_STACK.log
-            echo "Error running: $@"
-            exit 1
+            fail "Error running: $@"
         fi
     fi
 }
@@ -180,8 +218,7 @@ run_application () {
     shift
 
     if [ -z "$DOCKER_REGISTRY" ] && [ "$1" != "init" ]; then
-        echo "Unknown docker registry, please setup DOCKER_REGISTRY variable in configuration file at $CONFIG_FILE"
-        exit 1
+        fail "Unknown docker registry, please setup DOCKER_REGISTRY variable in configuration file at $CONFIG_FILE"
     fi
 
     if [ -z "$IMAGE_NAME" ]; then
@@ -210,7 +247,7 @@ run_application () {
             init_structure
             ;;
         build )
-            
+
             while [[ $# -gt 0 ]]
             do
                 case "$1" in
@@ -232,14 +269,14 @@ run_application () {
             fi
 
             for image in $IMAGES; do
-                build $image $TAG --build-arg APP_ENV=prod || exit 1
-                build $image $TAG_DEBUG --build-arg APP_ENV=dev || exit 1
+                build $image $TAG --build-arg APP_ENV=prod || fail
+                build $image $TAG_DEBUG --build-arg APP_ENV=dev || fail
             done
 
             ;;
 
         push )
-            
+
             while [[ $# -gt 0 ]]
             do
                 case "$1" in
@@ -255,28 +292,37 @@ run_application () {
                 esac
                 shift # past argument or value
             done
-            
+
             if [ -z "$IMAGES" ]; then
                 IMAGES=$DOCKER_IMAGES
             fi
 
             for image in $IMAGES; do
-                push $image $TAG || exit 1
-                push $image $TAG_DEBUG || exit 1
+                push $image $TAG || fail
+                push $image $TAG_DEBUG || fail
             done
         ;;
 
         rancher )
-            
+
             RANCHER_COMMAND=$1
             shift
             ARGS=
+            APP_ENV=dev
 
             while [[ $# -gt 0 ]]
             do
                 case "$1" in
                     -v)
                         VERBOSITY=verbose
+                    ;;
+                    -e)
+                        shift
+                        APP_ENV=$1
+                    ;;
+                    -s)
+                        shift
+                        RANCHER_STACK=$1
                     ;;
                     -h|--help)
                         cmd_help "Execute rancher command" "rancher [up|down|exec|export] [-v|--verbose]"
@@ -293,7 +339,12 @@ run_application () {
             done
 
 
-            cd $ROOT_DIR/docker/rancher;
+            CONTEXT_DIR=$ROOT_DIR/docker/rancher/$APP_ENV
+            if [ ! -d $CONTEXT_DIR ]; then
+                CONTEXT_DIR=$(dirname $CONTEXT_DIR)
+            fi
+
+            cd $CONTEXT_DIR
 
             case "$RANCHER_COMMAND" in
                 up )
@@ -370,11 +421,7 @@ run_application () {
         ;;
     esac
 
-    if [ ! -z $TMP_DIR ] && [ -d $TMP_DIR ]; then
-        rm -rf $TMP_DIR
-    fi
-
+    on_exit 0
 }
 
 run_application $COMMAND $@
-
