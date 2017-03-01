@@ -29,7 +29,7 @@ TAG_DEBUG=${BRANCH_TAG_MAP_DEBUG[$BRANCH]:-${BRANCH}-debug}
 TAG_DEBUG=${TAG_DEBUG/\//-}
 
 fail () {
-    if [ ! -z "$@" ]; then
+    if [ $# -ne 0 ]; then
         echo $@
     fi
     on_exit 1
@@ -85,6 +85,10 @@ remove_temp_dir() {
 }
 
 init_config () {
+    if [ ! -z "$DOCKER_REGISTRY" ]; then
+        fail "Project has been already initialized"
+    fi
+
     echo -n "Please enter docker registry domain name [$DOCKER_REGISTRY]: "
     read registry
 
@@ -201,9 +205,10 @@ EOL
     fi
 }
 
-EXECUTABLE=$(basename $0)
 
 cmd_help () {
+    EXECUTABLE=$(basename $0)
+
     echo $1
     echo
     echo "Usage:"
@@ -275,6 +280,9 @@ run_application () {
 
             ;;
 
+        images )
+            docker images | grep $IMAGE_NAME | grep $TAG
+            ;;
         push )
 
             while [[ $# -gt 0 ]]
@@ -361,7 +369,7 @@ run_application () {
                     ;;
                 exec )
                     echo "rancher exec $RANCHER_STACK/$ARGS"
-                    rancher exec $RANCHER_STACK/$ARGS
+                    rancher exec -it $RANCHER_STACK/$ARGS
                 ;;
                 export )
                     exec_quietly rancher export $RANCHER_STACK
@@ -374,20 +382,66 @@ run_application () {
         ;;
 
         compose )
-            export ROOT_DIR;
-            export TAG
-            export TAG_DEBUG
+            COMPOSE_COMMAND=$1
+            shift
+            ARGS=
+            APP_ENV=dev
 
-            cd $ROOT_DIR/docker/compose
-            case $2 in
+            while [[ $# -gt 0 ]]
+            do
+                case "$1" in
+                    -v)
+                        VERBOSITY=verbose
+                    ;;
+                    -e)
+                        shift
+                        APP_ENV=$1
+                    ;;
+                    -s)
+                        shift
+                        RANCHER_STACK=$1
+                    ;;
+                    -h|--help)
+                        cmd_help "Execute rancher command" "rancher [up|down|exec|export] [-v|--verbose]"
+                    ;;
+                    *)
+                        if [ -z $ARGS ]; then
+                            ARGS=$1
+                        else
+                            ARGS="$ARGS $1"
+                        fi
+                    ;;
+                esac
+                shift # past argument or value
+            done
+
+
+            CONTEXT_DIR=$ROOT_DIR/docker/compose/$APP_ENV
+            if [ ! -d $CONTEXT_DIR ]; then
+                CONTEXT_DIR=$(dirname $CONTEXT_DIR)
+            fi
+
+            cd $CONTEXT_DIR
+
+            case "$COMPOSE_COMMAND" in
                 up )
-                    docker-compose -p $RANCHER_STACK up -d
+                    (
+                    export ROOT_DIR
+                    export TAG
+                    export TAG_DEBUG
+                    export UID
+                    exec_quietly docker-compose -p $RANCHER_STACK up -d
+                    )
                     ;;
                 down )
                     docker-compose -p $RANCHER_STACK down
                     ;;
+                exec )
+                    echo "rancher exec $RANCHER_STACK/$ARGS"
+                    rancher exec -it $RANCHER_STACK/$ARGS
+                ;;
                 * )
-                    echo "Available actions: up, down"
+                    echo "Available actions: up, down, exec"
                     ;;
             esac
         ;;
@@ -408,6 +462,9 @@ run_application () {
             echo 'foo' | rancher exec -i $RANCHER_STACK/mongo xargs echo #$ROOT_DIR/$IMAGES_DIR/mongo/backup.bz2  #mongorestore --gzip --archive
         ;;
 
+        tag )
+            echo $TAG;
+        ;;
         * )
             echo "GitLab Docker v0.2.0-dev"
             echo "Usage:"
