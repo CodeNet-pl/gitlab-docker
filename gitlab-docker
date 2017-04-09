@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 ROOT_DIR=$(git rev-parse --show-toplevel)
 
@@ -16,6 +17,10 @@ REMOTE=$(git config --get remote.origin.url  | tr '[:upper:]' '[:lower:]')
 IMAGES_DIR=docker/images
 RANCHER_DIR=docker/rancher
 RANCHER_LB_STACK=load-balancer
+BUILD_ENV_VAR_NAME=APP_ENV
+BUILD_ENV_VAR_DEBUG=dev
+BUILD_ENV_VAR_NO_DEBUG=prod
+
 CONFIG_FILE=$ROOT_DIR/.gitlab-docker
 TMP_DIR=/tmp/.gitlab-docker
 mkdir -p $TMP_DIR
@@ -23,16 +28,57 @@ mkdir -p $TMP_DIR
 declare -A BRANCH_TAG_MAP=( ["master"]="stable" ["develop"]="latest")
 declare -A BRANCH_TAG_MAP_DEBUG=( ["master"]="stable-debug" ["develop"]="debug")
 
-TAG=${BRANCH_TAG_MAP[$BRANCH]:-$BRANCH}
-TAG=${TAG/\//-}
-TAG_DEBUG=${BRANCH_TAG_MAP_DEBUG[$BRANCH]:-${BRANCH}-debug}
-TAG_DEBUG=${TAG_DEBUG/\//-}
+
+normalize_tag () {
+    path=$1
+    tag=$2
+
+    if [ "$path" != "." ]; then
+        if [ "$tag" == "latest" ]; then
+            echo $path
+        else
+            echo $path-$tag
+        fi
+    else
+        if [ "$tag" == "latest" ]; then
+            echo "latest"
+        else
+            echo $tag
+        fi
+    fi
+}
+
+image_tag_from_branch () {
+    path=$1
+    branch=$2
+
+    tag=${BRANCH_TAG_MAP[$branch]:-$branch}
+    tag=${tag/\//-}
+
+    normalize_tag $path $tag
+}
+
+image_tag_debug_from_branch () {
+    path=$1
+    branch=$2
+
+    tag=${BRANCH_TAG_MAP_DEBUG[$branch]:-${branch}-debug}
+    tag=${tag/\//-}
+
+    normalize_tag $path $tag
+}
+
+#TAG=$(image_tag_from_branch $BRANCH)
+#TAG_DEBUG=$(image_tag_debug_from_branch $BRANCH)
 
 fail () {
     if [ $# -ne 0 ]; then
         echo $@
     fi
-    on_exit 1
+}
+
+deprecated () {
+    echo $@
 }
 
 re="\.[a-z]+[:/]([^./]*)/([^./]*)"
@@ -61,13 +107,13 @@ fi
 VERBOSITY=normal
 COMMAND=$1
 shift
-export ON_EXIT_COMMAND="remove_temp_dir"
 
 on_exit() {
     cleanup_compiled_dockerfiles
-
-    exit $1
+    remove_temp_dir
 }
+
+trap "on_exit" EXIT
 
 cleanup_compiled_dockerfiles () {
     for img in $DOCKER_IMAGES; do
@@ -100,17 +146,26 @@ init_config () {
 }
 
 image_name () {
+    image=$1
+    branch=$2
+    echo "$IMAGE_NAME:$(image_tag_fallback $image $branch)"
+}
+
+
+image_tag_fallback () {
     path=$1
-    shift
-    tag=$1
-    shift
-    image=$IMAGE_NAME
+    tag=$2
 
-    if [ "$path" != "." ]; then
-        tag=${path}-${tag}
+    exists=$(docker image ls --filter "reference=$IMAGE_NAME:$tag" --format "{{.Repository}}")
+    if [ -z "$exists" ]; then
+        if [ "$path" != "." ]; then
+            echo $path
+        else
+            echo "latest"
+        fi
+    else
+        echo $tag
     fi
-
-    echo "${image}:${tag}"
 }
 
 image_path () {
@@ -126,11 +181,13 @@ image_path () {
 }
 
 build () {
-    BUILD_IMAGE_DIR=$(image_path $1)
-    BUILD_IMAGE_NAME=$(image_name $1 $2)
+    image=$1
+    tag=$2
+
+    BUILD_IMAGE_DIR=$(image_path $image)
+    BUILD_IMAGE_NAME="$IMAGE_NAME:$tag"
     BUILD_CONTEXT=$BUILD_IMAGE_DIR
     BUILD_DOCKERFILE=$BUILD_IMAGE_DIR/Dockerfile
-    BUILD_TAG=$2
     shift
     shift
 
@@ -150,6 +207,7 @@ push () {
 
 exec_quietly () {
     if [ "$VERBOSITY" == "verbose" ]; then
+        echo $@
         $@
 
         if [ $? -ne 0 ]; then
@@ -163,48 +221,6 @@ exec_quietly () {
         fi
     fi
 }
-
-init_structure () {
-    if [ ! -d "$ROOT_DIR/$IMAGES_DIR/fpm" ]; then
-        mkdir -p "$ROOT_DIR/$IMAGES_DIR/fpm"
-    fi
-    if [ ! -f "$ROOT_DIR/$IMAGES_DIR/fpm/Dockerfile" ]; then
-        cat > $ROOT_DIR/$IMAGES_DIR/fpm/Dockerfile << EOL
-FROM php:7.1-fpm-alpine
-ARG APP_ENV
-WORKDIR /app
-EOL
-    fi
-    if [ ! -d "$ROOT_DIR/$IMAGES_DIR/cli" ]; then
-        mkdir -p "$ROOT_DIR/$IMAGES_DIR/cli"
-    fi
-    if [ ! -f "$ROOT_DIR/$IMAGES_DIR/cli/Dockerfile" ]; then
-        cat > $ROOT_DIR/$IMAGES_DIR/cli/Dockerfile << EOL
-FROM php:7.1-alpine
-ARG APP_ENV
-WORKDIR /app
-EOL
-    fi
-    if [ ! -d "$ROOT_DIR/$RANCHER_DIR" ]; then
-        mkdir -p "$ROOT_DIR/$RANCHER_DIR"
-    fi
-    if [ ! -f $ROOT_DIR/Dockerfile ]; then
-        cat > $ROOT_DIR/Dockerfile << EOL
-FROM php:7.1-alpine
-ADD . /app
-WORKDIR /app
-RUN rm -rf docker
-
-EOL
-    fi
-
-    if [ ! -f "$ROOT_DIR/.dockerignore" ]; then
-        cat > $ROOT_DIR/.dockerignore << EOL
-vendor
-EOL
-    fi
-}
-
 
 cmd_help () {
     EXECUTABLE=$(basename $0)
@@ -242,6 +258,7 @@ run_application () {
             echo "Image tag: $TAG"
             echo "Image Debug Tag: $TAG_DEBUG"
             echo "Temporary directory: $TMP_DIR"
+            echo "Build env var: $BUILD_ENV_VAR_NAME ($BUILD_ENV_VAR_DEBUG / $BUILD_ENV_VAR_NO_DEBUG)"
             echo
             echo "You can override any of those variables in configuration file $CONFIG_FILE"
 
@@ -252,12 +269,20 @@ run_application () {
             init_structure
             ;;
         build )
+            dev=1
+            prod=1
 
             while [[ $# -gt 0 ]]
             do
                 case "$1" in
                     -v|--verbose)
                         VERBOSITY=verbose
+                    ;;
+                    --no-debug)
+                        dev=0
+                    ;;
+                    --debug)
+                        prod=0
                     ;;
                     -h|--help)
                         cmd_help "Build images given as argument" "build [image1 image2 ...] [-v|--verbose]"
@@ -274,26 +299,40 @@ run_application () {
             fi
 
             for image in $IMAGES; do
-                build $image $TAG --build-arg APP_ENV=prod || fail
-                build $image $TAG_DEBUG --build-arg APP_ENV=dev || fail
+                if [ $prod -eq 1 ]; then
+                    build $image $(image_tag_from_branch $image $BRANCH) --build-arg $BUILD_ENV_VAR_NAME=prod || fail
+                fi
+                if [ $dev -eq 1 ]; then
+                    build $image $(image_tag_debug_from_branch $image $BRANCH) --build-arg $BUILD_ENV_VAR_NAME=dev || fail
+                fi
             done
 
             ;;
 
         images )
-            docker images | grep $IMAGE_NAME | grep $TAG
+            docker image ls --filter "reference=$IMAGE_NAME"
             ;;
+
         push )
+
+            dev=1
+            prod=1
 
             while [[ $# -gt 0 ]]
             do
                 case "$1" in
-                    -v)
+                    -v|--verbose)
                         VERBOSITY=verbose
                     ;;
-                    -h|--help)
-                        cmd_help "Push images given as argument" "push [image1 image2 ...] [-v|--verbose]"
+                    --no-debug)
+                        dev=0
                     ;;
+                    --debug)
+                        prod=0
+                    ;;
+                    -h|--help)
+                        cmd_help "Build images given as argument" "build [image1 image2 ...] [-v|--verbose]"
+                        ;;
                     *)
                         IMAGES="$IMAGES $1"
                     ;;
@@ -305,9 +344,14 @@ run_application () {
                 IMAGES=$DOCKER_IMAGES
             fi
 
+
             for image in $IMAGES; do
-                push $image $TAG || fail
-                push $image $TAG_DEBUG || fail
+                if [ $prod -eq 1 ]; then
+                    push $image $(image_tag_from_branch $image $BRANCH) || fail
+                fi
+                if [ $dev -eq 1 ]; then
+                    push $image $(image_tag_debug_from_branch $image $BRANCH) || fail
+                fi
             done
         ;;
 
@@ -316,7 +360,17 @@ run_application () {
             RANCHER_COMMAND=$1
             shift
             ARGS=
-            APP_ENV=dev
+            if [ -d "$ROOT_DIR/$RANCHER_DIR/local" ]; then
+                APP_ENV=local
+            elif [ -d "$ROOT_DIR/$RANCHER_DIR/dev" ]; then
+                deprecated "Use of dev environment is deprecated, change your directory name to 'local' in '$ROOT_DIR/$RANCHER_DIR'."
+                APP_ENV=dev
+            fi
+
+            RANCHER_ENV_ARG="--env Default"
+            if [ ! -z "$RANCHER_ENVIRONMENT" ]; then
+                RANCHER_ENV_ARG="--env $RANCHER_ENVIRONMENT"
+            fi
 
             while [[ $# -gt 0 ]]
             do
@@ -346,8 +400,7 @@ run_application () {
                 shift # past argument or value
             done
 
-
-            CONTEXT_DIR=$ROOT_DIR/docker/rancher/$APP_ENV
+            CONTEXT_DIR=$ROOT_DIR/$RANCHER_DIR/$APP_ENV
             if [ ! -d $CONTEXT_DIR ]; then
                 CONTEXT_DIR=$(dirname $CONTEXT_DIR)
             fi
@@ -358,21 +411,27 @@ run_application () {
                 up )
                     (
                     export ROOT_DIR
-                    export TAG
-                    export TAG_DEBUG
+
+#                    for IMAGE in $DOCKER_IMAGES; do
+#                        declare "$IMAGE_TAG"=$(image_tag_fallback . $(image_tag_from_branch $path $BRANCH))
+#                        declare "$IMAGE_TAG_DEBUG"=$(image_tag_fallback . $(image_tag_debug_from_branch $path $BRANCH))
+#                    done
+                    export TAG=$(image_tag_fallback . $(image_tag_from_branch . $BRANCH))
+                    export TAG_DEBUG=$(image_tag_fallback . $(image_tag_debug_from_branch . $BRANCH))
+
                     export UID
-                    exec_quietly rancher up -d -s $RANCHER_STACK --confirm-upgrade --force-upgrade $ARGS
+                    exec_quietly rancher $RANCHER_ENV_ARG up -d -s $RANCHER_STACK --confirm-upgrade --force-upgrade $ARGS
                     )
                     ;;
                 down )
-                    rancher rm $RANCHER_STACK
+                    rancher $RANCHER_ENV_ARG rm $RANCHER_STACK
                     ;;
                 exec )
                     echo "rancher exec $RANCHER_STACK/$ARGS"
-                    rancher exec -it $RANCHER_STACK/$ARGS
+                    rancher $RANCHER_ENV_ARG exec -it $RANCHER_STACK/$ARGS
                 ;;
                 export )
-                    exec_quietly rancher export $RANCHER_STACK
+                    exec_quietly rancher $RANCHER_ENV_ARG export $RANCHER_STACK
                     mv $RANCHER_STACK export
                     ;;
                 * )
@@ -434,6 +493,10 @@ run_application () {
                     )
                     ;;
                 down )
+                    export ROOT_DIR
+                    export TAG
+                    export TAG_DEBUG
+                    export UID
                     docker-compose -p $RANCHER_STACK down
                     ;;
                 exec )
@@ -463,7 +526,53 @@ run_application () {
         ;;
 
         tag )
-            echo $TAG;
+            build=0
+            debug=0
+            branch=
+            path=
+            while [[ $# -gt 0 ]]
+            do
+                case "$1" in
+                    --build|-b)
+                        build=1
+                    ;;
+                    --debug)
+                        debug=1
+                    ;;
+                    -h|--help)
+                        cmd_help "Prints out an image tag" "tag [name] [-b|--build]"
+                    ;;
+                    *)
+                        if [ -z "$path" ]; then
+                            path=$1
+                        elif [ -z "$tag" ]; then
+                            branch=$1
+                        else
+                            fail "Unknown argument: $1"
+                        fi
+                    ;;
+                esac
+                shift # past argument or value
+            done
+
+            if [ -z "$path" ]; then
+                path="."
+            fi
+
+            if [ -z "$branch" ]; then
+                branch=$BRANCH
+            fi
+
+            if [ $build -eq 1 ]; then
+                tag=$(image_tag_from_branch $path $branch)
+            else
+                tag=$(image_tag_fallback $path $(image_tag_from_branch $path $branch))
+            fi
+            if [ $debug -eq 1 ]; then
+                echo ${tag}-debug
+            else
+                echo $tag
+            fi
         ;;
         * )
             echo "GitLab Docker v0.2.0-dev"
@@ -477,8 +586,6 @@ run_application () {
             echo "   "`basename $0`" deploy - deploy project using rancher"
         ;;
     esac
-
-    on_exit 0
 }
 
 run_application $COMMAND $@
