@@ -34,17 +34,9 @@ normalize_tag () {
     tag=$2
 
     if [ "$path" != "." ]; then
-        if [ "$tag" == "latest" ]; then
-            echo $path
-        else
-            echo $path-$tag
-        fi
+        echo $path-$tag
     else
-        if [ "$tag" == "latest" ]; then
-            echo "latest"
-        else
-            echo $tag
-        fi
+        echo $tag
     fi
 }
 
@@ -416,8 +408,8 @@ run_application () {
 #                        declare "$IMAGE_TAG"=$(image_tag_fallback . $(image_tag_from_branch $path $BRANCH))
 #                        declare "$IMAGE_TAG_DEBUG"=$(image_tag_fallback . $(image_tag_debug_from_branch $path $BRANCH))
 #                    done
-                    export TAG=$(image_tag_fallback . $(image_tag_from_branch . $BRANCH))
-                    export TAG_DEBUG=$(image_tag_fallback . $(image_tag_debug_from_branch . $BRANCH))
+                    export TAG=$(image_tag_from_branch . $BRANCH)
+                    export TAG_DEBUG=$(image_tag_debug_from_branch . $BRANCH)
 
                     export UID
                     exec_quietly rancher $RANCHER_ENV_ARG up -d -s $RANCHER_STACK --confirm-upgrade --force-upgrade $ARGS
