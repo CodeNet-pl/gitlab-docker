@@ -139,8 +139,8 @@ init_config () {
 
 image_name () {
     image=$1
-    branch=$2
-    echo "$IMAGE_NAME:$(image_tag_fallback $image $branch)"
+    tag=$2
+    echo "$IMAGE_NAME:$tag"
 }
 
 
