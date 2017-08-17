@@ -555,16 +555,7 @@ run_application () {
                 branch=$BRANCH
             fi
 
-            if [ $build -eq 1 ]; then
-                tag=$(image_tag_from_branch $path $branch)
-            else
-                tag=$(image_tag_fallback $path $(image_tag_from_branch $path $branch))
-            fi
-            if [ $debug -eq 1 ]; then
-                echo ${tag}-debug
-            else
-                echo $tag
-            fi
+            echo $(image_tag_from_branch $path $branch)
         ;;
         * )
             echo "GitLab Docker v0.2.0-dev"
